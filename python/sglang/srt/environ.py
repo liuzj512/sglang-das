@@ -450,8 +450,6 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
-    # Use the LightOp kernel for paged KV-cache extend allocation.
-    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -841,8 +839,6 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")  # HCU override
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
-
-    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1337,6 +1333,11 @@ class Envs:
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # ===================================================================
+    # Hunyuan V4
+    # ===================================================================
+    SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+
+    # ===================================================================
     # DeepSeek V4
     # ===================================================================
 
@@ -1357,7 +1358,6 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
-    SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.

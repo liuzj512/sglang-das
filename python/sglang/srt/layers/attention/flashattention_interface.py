@@ -32,7 +32,7 @@ _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
     "SGLANG_KV_LAYOUT_HCU_FA", default="true"
 )
 
-if _is_hcu:
+if _is_hcu and _use_triton_vllm_fa:
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
         triton_vllm_flash_attn_varlen_func,
         triton_vllm_flash_attn_with_kvcache,
@@ -434,15 +434,8 @@ def vllm_flash_attn_varlen_func(
     k_descale,
     v_descale,
     layout=None,
-    out=None,
 ):
-    use_hcu_fp8_swa_fallback = (
-        _is_hcu
-        and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and window_size is not None
-        and window_size[0] >= 0
-    )
-    if _is_hcu and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback):
+    if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_varlen_func(
             q=q,
             k=k,
@@ -460,7 +453,6 @@ def vllm_flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             layout=layout,
-            out=out,
         )
 
     return vllm_flash_attn_varlen_func_interface(
