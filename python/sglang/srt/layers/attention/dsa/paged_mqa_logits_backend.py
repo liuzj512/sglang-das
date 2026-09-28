@@ -28,11 +28,13 @@ class DSAPagedMQALogitsBackend(Enum):
         # HCU reports itself as a HIP platform, but its DSA indexer uses the
         # LightOp page-64 layout rather than AITER's ROCm layout.
         if is_hcu():
-            if value not in ("auto", "lightop"):
+            if value not in ("auto", "lightop", "aiter"):
                 raise ValueError(
                     f"dsa_paged_mqa_logits_backend={value!r} is not supported on "
-                    "HCU; only 'lightop' is implemented."
+                    "HCU; supported: 'auto'|'lightop'|'aiter'."
                 )
+            if value == "aiter":
+                return DSAPagedMQALogitsBackend.AITER
             return DSAPagedMQALogitsBackend.LIGHTOP
 
         if is_hip():

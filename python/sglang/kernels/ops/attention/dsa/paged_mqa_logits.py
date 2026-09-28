@@ -103,27 +103,51 @@ def aiter_paged_mqa_logits(
     preshuffle: bool,
     kv_block_size: int,
 ) -> torch.Tensor:
-    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    # Route to Hygon-native aiter FP8 paged-MQA (opus kernel).
+    # Signature: paged_mqa_logits(q[B,R,H,128] e4m3fn, kv_cache uint8[P,S,1,132],
+    #   weights fp32[B*R,H], context_lens i32[B], block_tables i32[B,T],
+    #   max_model_len:int, *, out=None, clean_logits=True, kernelId=None).
+    # ROCm/CUDA triton path is unavailable in this HCU container image.
+    try:
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits  # noqa: F401
+        _use_triton = True
+    except Exception:
+        _use_triton = False
 
-    q_fp8 = q_fp8.unsqueeze(1)
-    batch_size, next_n, _, _ = q_fp8.shape
-    logits = torch.empty(
-        (batch_size * next_n, max_seq_len),
-        device=q_fp8.device,
-        dtype=torch.float32,
-    )
-    deepgemm_fp8_paged_mqa_logits(
-        q_fp8,
+    if _use_triton:
+        q_fp8_ = q_fp8.unsqueeze(1)
+        batch_size, next_n, _, _ = q_fp8_.shape
+        logits = torch.empty(
+            (batch_size * next_n, max_seq_len),
+            device=q_fp8_.device,
+            dtype=torch.float32,
+        )
+        deepgemm_fp8_paged_mqa_logits(
+            q_fp8_,
+            kv_cache_fp8,
+            weights,
+            logits,
+            seq_lens,
+            block_tables,
+            max_seq_len,
+            Preshuffle=preshuffle,
+            KVBlockSize=kv_block_size,
+        )
+        return logits
+
+    # Fallback: Hygon opus kernel (validated on gfx938 in this image).
+    from aiter import paged_mqa_logits as _aiter_opus_paged_mqa_logits
+
+    q4 = q_fp8 if q_fp8.ndim == 4 else q_fp8.unsqueeze(1)
+    return _aiter_opus_paged_mqa_logits(
+        q4,
         kv_cache_fp8,
         weights,
-        logits,
         seq_lens,
         block_tables,
         max_seq_len,
-        Preshuffle=preshuffle,
-        KVBlockSize=kv_block_size,
+        clean_logits=False,
     )
-    return logits
 
 
 def cutedsl_paged_mqa_logits(
