@@ -36,6 +36,7 @@ from sglang.srt.models.hunyuan_v4 import (
     hyv4_attn_tp_split,
     hyv4_dp_attn_scattered,
     hyv4_linear_scale_suffix,
+    hyv4_shared_experts_fusion_disable_reason,
     permute_hyv4_indexer_weight,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -225,6 +226,9 @@ class HYV4ModelNextN(nn.Module):
 
 class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()

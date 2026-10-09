@@ -116,6 +116,19 @@ def hyv4_dp_attn_scattered() -> bool:
     return is_dp_attention_enabled() and get_parallel().attn_tp_size > 1
 
 
+def hyv4_shared_experts_fusion_disable_reason(config, quant_config):
+    # The fused MoE has a single activation limit for all expert slots, while
+    # HYV4's shared expert must remain unclamped. Keep it on the separate MLP
+    # path until fusion supports distinct routed/shared activation semantics.
+    if (
+        getattr(config, "swiglu_limit", None) is not None
+        and (getattr(config, "n_shared_experts", 0) or 0) > 0
+    ):
+        return "HYV4 SwiGLU clipping applies to routed experts only."
+    return None
+
+
+
 def hyv4_attn_tp_split(tensor: torch.Tensor) -> torch.Tensor:
     """TP_ATTN_FULL -> SCATTERED along the token dim. A view, no communication.
 
@@ -773,6 +786,9 @@ class HYV4Model(nn.Module):
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    shared_experts_fusion_disable_reason = staticmethod(
+        hyv4_shared_experts_fusion_disable_reason
+    )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
