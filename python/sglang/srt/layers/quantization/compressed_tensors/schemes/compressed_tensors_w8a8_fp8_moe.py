@@ -301,7 +301,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        from deepgemm.group_gemm_weight_pack import marlin_fp8_contiguous_weight as pack_int8_weight_enk_to_w6_low_latency
 
         with torch.no_grad():
             w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
