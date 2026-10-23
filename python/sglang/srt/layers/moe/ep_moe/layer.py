@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
@@ -376,6 +377,64 @@ def _ep_scatter_with_optional_lightop(
     return m_indices, output_index
 
 
+def run_hcu_w4a8_hipc(
+    a, b, out, masked_m, expected_m, *, overlap_args=None, meta_overlap_args=None
+):
+    gemm = import_module("deepgemm").m_grouped_w4a8_gemm_nt_masked_hipc
+    enabled = overlap_args is not None
+    if enabled:
+        if meta_overlap_args is None:
+            raise ValueError("W4A8 HIPC overlap requires shared DeepEP metadata")
+        overlap_args.start_event.record()
+    block_m, threshold = gemm(
+        a,
+        b,
+        out,
+        masked_m,
+        expected_m,
+        enable_overlap=enabled,
+        signal=overlap_args.signal if enabled else None,
+    )
+    if enabled:
+        if (
+            block_m <= 0
+            or (64 % block_m != 0 and block_m % 64 != 0)
+            or threshold <= 0
+        ):
+            raise ValueError(f"Invalid W4A8 HIPC completion metadata: {block_m}, {threshold}")
+        meta_overlap_args.update(block_m=block_m, threshold=threshold)
+    return out
+
+
+def run_hcu_fp8_pair32(
+    a, b, out, masked_m, expected_m, *, overlap_args=None, meta_overlap_args=None
+):
+    gemm = import_module(
+        "deepgemm.m_group_gemm_nt_masked"
+    ).m_grouped_fp8_gemm_nt_masked_pair32
+    enabled = overlap_args is not None
+    if enabled:
+        if meta_overlap_args is None:
+            raise ValueError("FP8 pair32 overlap requires shared DeepEP metadata")
+        overlap_args.start_event.record()
+    # The native schema requires a Tensor even when signals are not read.
+    signal = overlap_args.signal if enabled else masked_m
+    block_m, threshold = gemm(
+        a,
+        b,
+        out,
+        masked_m,
+        expected_m,
+        enable_overlap=enabled,
+        signal=signal,
+    )
+    if enabled:
+        if block_m not in (64, 128) or threshold <= 0:
+            raise ValueError(f"Invalid pair32 completion metadata: {block_m}, {threshold}")
+        meta_overlap_args.update(block_m=block_m, threshold=threshold)
+    return out
+
+
 # ------ custom op for lightop
 def m_grouped_w4a8_gemm_nt_masked_wrapper(
     a0: torch.Tensor,
@@ -416,13 +475,16 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     masked_m: torch.Tensor,
     expected_m_per_group: int,
 ) -> torch.Tensor:
-    return m_grouped_w4a8_gemm_nt_masked_hipc(
+    # DeepGEMM writes d in place and returns tile metadata in newer wheels.
+    m_grouped_w4a8_gemm_nt_masked_hipc(
         (a0, a1),
         (b0, b1),
         d,
         masked_m,
         expected_m_per_group,
     )
+
+    return d
 
 
 def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
@@ -568,6 +630,16 @@ class DeepEPMoE(FusedMoE):
     """
 
     _has_printed = False
+
+    @property
+    def supports_down_gemm_overlap(self) -> bool:
+        if self.deprecate_flag:
+            return True
+        if self.use_w4a8_marlin:
+            return _is_hcu and _use_w4a8_masked_hipc
+        if _is_hcu and self.use_fp8_w8a8:
+            return self._hcu_fp8_pair32
+        return True
 
     def __init__(
         self,
@@ -734,6 +806,8 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+
+        self._hcu_fp8_pair32 = False
 
         self.deepep_mode = get_deepep_mode()
 
@@ -1879,6 +1953,13 @@ class DeepEPMoE(FusedMoE):
             if _use_w4a8_masked_hipc
             else torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked
         )
+        overlap_state = self.runner if hasattr(self, "runner") else self
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
+            overlap_state, "down_gemm_overlap_args", None
+        )
+        meta_overlap_args: Optional[dict] = getattr(
+            overlap_state, "meta_overlap_args", None
+        )
 
         # ---- first GEMM ----
         grouped_w4a8_op(
@@ -1925,15 +2006,26 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        grouped_w4a8_op(
-            q_a2_all,
-            q_a2_scale,
-            w2_weight,
-            w2_scales,
-            down_output,
-            masked_m,
-            expected_m,
-        )
+        if down_gemm_overlap_args is not None:
+            run_hcu_w4a8_hipc(
+                (q_a2_all, q_a2_scale),
+                (w2_weight, w2_scales),
+                down_output,
+                masked_m,
+                expected_m,
+                overlap_args=down_gemm_overlap_args,
+                meta_overlap_args=meta_overlap_args,
+            )
+        else:
+            grouped_w4a8_op(
+                q_a2_all,
+                q_a2_scale,
+                w2_weight,
+                w2_scales,
+                down_output,
+                masked_m,
+                expected_m,
+            )
 
         return down_output
 
@@ -2009,14 +2101,15 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
-        # This HCU low-latency DeepGEMM path predates the MoeRunner refactor.
-        # Its overlap state is therefore stored directly on DeepEPMoE by
-        # FusedMoE.set_overlap_args(), and no ``self.runner`` is constructed.
+        # Match FusedMoE.set_overlap_args()/clear_overlap_args(): modern
+        # layers store overlap state on the runner; legacy layers use self.
+        # Keep the shared metadata object so DeepEP sees the GEMM signal layout.
+        overlap_state = self.runner if hasattr(self, "runner") else self
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
-            self, "down_gemm_overlap_args", None
+            overlap_state, "down_gemm_overlap_args", None
         )
         meta_overlap_args: Optional[dict] = getattr(
-            self, "meta_overlap_args", None
+            overlap_state, "meta_overlap_args", None
         )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
@@ -2042,7 +2135,11 @@ class DeepEPMoE(FusedMoE):
 
         from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        pair32 = self._hcu_fp8_pair32
+        grouped_fp8_op = (
+            run_hcu_fp8_pair32 if pair32 else m_grouped_fp8_gemm_nt_masked_ll
+        )
+        grouped_fp8_op(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -2068,22 +2165,26 @@ class DeepEPMoE(FusedMoE):
 
         enable_overlap = down_gemm_overlap_args is not None
 
-        if enable_overlap:
-            down_gemm_overlap_args.start_event.record()
-
-        m_grouped_fp8_gemm_nt_masked_ll(
-            (q_a2_all, q_a2_scale),
-            (w2_weight, w2_scales),
-            down_output,
-            masked_m,
-            expected_m,
-            enable_overlap,
-            down_gemm_overlap_args.signal if enable_overlap else None,
-        )
-
-        if meta_overlap_args is not None:
-            meta_overlap_args["block_m"] = 64
-            meta_overlap_args["threshold"] = 32
+        if enable_overlap and not pair32:
+            raise RuntimeError("HCU FP8 down-GEMM overlap requires DeepGEMM pair32")
+        if pair32:
+            run_hcu_fp8_pair32(
+                (q_a2_all, q_a2_scale),
+                (w2_weight, w2_scales),
+                down_output,
+                masked_m,
+                expected_m,
+                overlap_args=down_gemm_overlap_args,
+                meta_overlap_args=meta_overlap_args,
+            )
+        else:
+            grouped_fp8_op(
+                (q_a2_all, q_a2_scale),
+                (w2_weight, w2_scales),
+                down_output,
+                masked_m,
+                expected_m,
+            )
 
         return down_output
 

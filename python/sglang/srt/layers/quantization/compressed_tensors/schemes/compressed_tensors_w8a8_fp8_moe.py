@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import import_module
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -75,6 +76,15 @@ if _use_aiter and not _is_hcu:
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_hcu_fp8_pair32_packer(device):
+    if device.type != "cuda" or get_global_server_args().deepep_mode != "low_latency":
+        return None
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+    if arch != "gfx938":
+        return None
+    return import_module("deepgemm.group_gemm_weight_pack").pack_fp8_weight_pair32
 
 
 def is_moe_prefill_or_normal():
@@ -301,12 +311,21 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
-        from deepgemm.group_gemm_weight_pack import marlin_fp8_contiguous_weight as pack_int8_weight_enk_to_w6_low_latency
-
+        pair32_pack = get_hcu_fp8_pair32_packer(w13.device)
+        layer._hcu_fp8_pair32 = pair32_pack is not None
+        if pair32_pack is not None:
+            pack_weight = pair32_pack
+        elif get_global_server_args().deepep_mode == "low_latency":
+            from deepgemm.m_group_gemm import (
+                pack_int8_weight_enk_to_w6_low_latency_inplace as pack_weight,
+            )
+        else:
+            from deepgemm.group_gemm_weight_pack import (
+                marlin_fp8_contiguous_weight as pack_weight,
+            )
         with torch.no_grad():
-            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_deepgemm = pack_weight(w13).detach()
+            w2_deepgemm = pack_weight(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
